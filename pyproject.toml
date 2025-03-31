@@ -2,7 +2,7 @@
 requires = [
     "setuptools>=42",
     "wheel",
-    "torch>=1.8",
+    "torch>=2.6.0",
     "ninja",  # Required for CUDA extensions
     "typing-extensions>=4.0.0",  # Required by torch.utils.cpp_extension
 ]
@@ -10,14 +10,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fused_ssim"
-version = "0.1.1"
+version = "0.1.2"
 description = "CUDA-accelerated SSIM implementation"
 authors = [
     {name = "Rahul Goel", email = "rahulgoellko@gmail.com"},
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.11"
 dependencies = [
-    "torch>=1.8",
+    "torch>=2.6.0",
 ]
 
 [project.urls]
