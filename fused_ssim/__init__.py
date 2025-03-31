@@ -1,5 +1,3 @@
-from typing import NamedTuple
-import torch.nn as nn
 import torch
 from fused_ssim_cuda import fusedssim, fusedssim_backward
 
