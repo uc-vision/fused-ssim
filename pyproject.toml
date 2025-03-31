@@ -15,7 +15,7 @@ description = "CUDA-accelerated SSIM implementation"
 authors = [
     {name = "Rahul Goel", email = "rahulgoellko@gmail.com"},
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
     "torch>=2.6.0",
 ]
