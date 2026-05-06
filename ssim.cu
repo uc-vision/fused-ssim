@@ -442,6 +442,7 @@ fusedssim(
     bool train
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+    auto stream = at::cuda::getCurrentCUDAStream();
     int B  = img1.size(0);
     int CH = img1.size(1);
     int H  = img1.size(2);
@@ -461,7 +462,7 @@ fusedssim(
     auto dm_dsigma1_sq = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
     auto dm_dsigma12   = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
 
-    fusedssimCUDA<<<grid, block>>>(
+    fusedssimCUDA<<<grid, block, 0, stream>>>(
         H, W, CH, C1, C2,
         img1.contiguous().data_ptr<float>(),
         img2.contiguous().data_ptr<float>(),
@@ -492,6 +493,7 @@ fusedssim_backward(
     torch::Tensor &dm_dsigma12
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+    auto stream = at::cuda::getCurrentCUDAStream();
     int B  = img1.size(0);
     int CH = img1.size(1);
     int H  = img1.size(2);
@@ -504,7 +506,7 @@ fusedssim_backward(
               B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    fusedssim_backwardCUDA<<<grid, block>>>(
+    fusedssim_backwardCUDA<<<grid, block, 0, stream>>>(
         H, W, CH, C1, C2,
         img1.contiguous().data_ptr<float>(),
         img2.contiguous().data_ptr<float>(),
