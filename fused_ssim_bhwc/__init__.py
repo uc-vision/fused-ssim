@@ -1,7 +1,7 @@
 import torch
 
 if torch.cuda.is_available():
-    from fused_ssim_cuda import fusedssim, fusedssim_backward
+    from fused_ssim_bhwc_cuda import fusedssim, fusedssim_backward
 
 allowed_padding = ["same", "valid"]
 

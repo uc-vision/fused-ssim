@@ -66,7 +66,7 @@ def configure_cuda():
             compiler_args["nvcc"].extend(fallback_archs)
             detected_arch = "multiple architectures"
 
-    return CUDAExtension, ["ssim.cu", "ssim3d.cu", "ext.cpp"], "fused_ssim_cuda", compiler_args, [], detected_arch
+    return CUDAExtension, ["ssim.cu", "ssim3d.cu", "ext.cpp"], "fused_ssim_bhwc_cuda", compiler_args, [], detected_arch
 
 
 def configure_mps():

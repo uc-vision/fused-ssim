@@ -28,9 +28,26 @@ __constant__ float cGauss[11] = {
 #define CONV_X BLOCK_X
 #define CONV_Y SHARED_Y
 
-template<int CH>
+// BHWC pixel fetch with zero padding
+__device__ __forceinline__ float get_pix_bhwc(
+    const float* img, int b, int c, int y, int x,
+    int CH, int H, int W
+) {
+    if (x < 0 || x >= W || y < 0 || y >= H) return 0.0f;
+    return img[b * H * W * CH + y * W * CH + x * CH + c];
+}
+
+// BCHW pixel fetch with zero padding (for internal derivative maps)
+__device__ __forceinline__ float get_pix_bchw(
+    const float* img, int b, int c, int y, int x,
+    int CH, int H, int W
+) {
+    if (x < 0 || x >= W || y < 0 || y >= H) return 0.0f;
+    return img[b * CH * H * W + c * H * W + y * W + x];
+}
+
 __global__ void fusedssimCUDA(
-    int H, int W,
+    int H, int W, int CH,
     float C1, float C2,
     const float* __restrict__ img1,
     const float* __restrict__ img2,
@@ -40,190 +57,147 @@ __global__ void fusedssimCUDA(
     float* __restrict__ dm_dsigma12
 ) {
     auto block = cg::this_thread_block();
-    const int bIdx  = block.group_index().z;
-    const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
-    const int pix_x = block.group_index().x * BLOCK_X + block.thread_index().x;
+    const int bIdx   = block.group_index().z;
+    const int pix_y  = block.group_index().y * BLOCK_Y + block.thread_index().y;
+    const int pix_x  = block.group_index().x * BLOCK_X + block.thread_index().x;
     const int pix_id = pix_y * W + pix_x;
     const int num_pix = H * W;
 
-    __shared__ float sTile[SHARED_Y][SHARED_X][2][CH];
-    __shared__ float xconv[CONV_Y][CONV_X][5][CH];
+    __shared__ float sTile[SHARED_Y][SHARED_X][2];
+    __shared__ float xconv[CONV_Y][CONV_X][5];
 
-    // 1) Load tile + halo — all channels coalesced
-    {
-        const int tileSize = SHARED_Y * SHARED_X;
-        const int threads  = BLOCK_X * BLOCK_Y;
-        const int steps    = (tileSize + threads - 1) / threads;
-        const int startY   = block.group_index().y * BLOCK_Y;
-        const int startX   = block.group_index().x * BLOCK_X;
-        const float* base1 = img1 + bIdx * num_pix * CH;
-        const float* base2 = img2 + bIdx * num_pix * CH;
-
-        for (int s = 0; s < steps; ++s) {
-            int tid = s * threads + block.thread_rank();
-            if (tid < tileSize) {
-                int ly = tid / SHARED_X;
-                int lx = tid % SHARED_X;
-                int gy = startY + ly - HALO;
-                int gx = startX + lx - HALO;
-                bool valid = (gx >= 0 && gx < W && gy >= 0 && gy < H);
-                int idx = gy * W * CH + gx * CH;
-
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    sTile[ly][lx][0][c] = valid ? base1[idx + c] : 0.0f;
-                    sTile[ly][lx][1][c] = valid ? base2[idx + c] : 0.0f;
-                }
-            }
-        }
-    }
-    block.sync();
-
-    // 2) Horizontal convolution — channel innermost
-    {
-        int ly = threadIdx.y;
-        int lx = threadIdx.x + HALO;
-
-        float sumX[CH], sumX2[CH], sumY[CH], sumY2[CH], sumXY[CH];
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            sumX[c] = 0.f; sumX2[c] = 0.f;
-            sumY[c] = 0.f; sumY2[c] = 0.f;
-            sumXY[c] = 0.f;
-        }
-
-        #pragma unroll
-        for (int d = 1; d <= HALO; ++d) {
-            float w = cGauss[HALO - d];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                float Xl = sTile[ly][lx - d][0][c];
-                float Yl = sTile[ly][lx - d][1][c];
-                float Xr = sTile[ly][lx + d][0][c];
-                float Yr = sTile[ly][lx + d][1][c];
-                sumX[c]  += (Xl + Xr) * w;
-                sumX2[c] += (Xl*Xl + Xr*Xr) * w;
-                sumY[c]  += (Yl + Yr) * w;
-                sumY2[c] += (Yl*Yl + Yr*Yr) * w;
-                sumXY[c] += (Xl*Yl + Xr*Yr) * w;
-            }
-        }
+    for (int c = 0; c < CH; ++c) {
+        // 1) Load tile from BHWC input
         {
-            float wc = cGauss[HALO];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                float X = sTile[ly][lx][0][c];
-                float Y = sTile[ly][lx][1][c];
-                sumX[c]  += X * wc;
-                sumX2[c] += X*X * wc;
-                sumY[c]  += Y * wc;
-                sumY2[c] += Y*Y * wc;
-                sumXY[c] += X*Y * wc;
-            }
-        }
+            const int tileSize = SHARED_Y * SHARED_X;
+            const int threads  = BLOCK_X * BLOCK_Y;
+            const int steps    = (tileSize + threads - 1) / threads;
+            const int startY   = block.group_index().y * BLOCK_Y;
+            const int startX   = block.group_index().x * BLOCK_X;
 
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            xconv[ly][threadIdx.x][0][c] = sumX[c];
-            xconv[ly][threadIdx.x][1][c] = sumX2[c];
-            xconv[ly][threadIdx.x][2][c] = sumY[c];
-            xconv[ly][threadIdx.x][3][c] = sumY2[c];
-            xconv[ly][threadIdx.x][4][c] = sumXY[c];
-        }
-
-        int ly2 = ly + BLOCK_Y;
-        if (ly2 < CONV_Y) {
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                sumX[c] = 0.f; sumX2[c] = 0.f;
-                sumY[c] = 0.f; sumY2[c] = 0.f;
-                sumXY[c] = 0.f;
-            }
-            #pragma unroll
-            for (int d = 1; d <= HALO; ++d) {
-                float w = cGauss[HALO - d];
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    float Xl = sTile[ly2][lx - d][0][c];
-                    float Yl = sTile[ly2][lx - d][1][c];
-                    float Xr = sTile[ly2][lx + d][0][c];
-                    float Yr = sTile[ly2][lx + d][1][c];
-                    sumX[c]  += (Xl + Xr) * w;
-                    sumX2[c] += (Xl*Xl + Xr*Xr) * w;
-                    sumY[c]  += (Yl + Yr) * w;
-                    sumY2[c] += (Yl*Yl + Yr*Yr) * w;
-                    sumXY[c] += (Xl*Yl + Xr*Yr) * w;
+            for (int s = 0; s < steps; ++s) {
+                int tid = s * threads + block.thread_rank();
+                if (tid < tileSize) {
+                    int ly = tid / SHARED_X;
+                    int lx = tid % SHARED_X;
+                    int gy = startY + ly - HALO;
+                    int gx = startX + lx - HALO;
+                    sTile[ly][lx][0] = get_pix_bhwc(img1, bIdx, c, gy, gx, CH, H, W);
+                    sTile[ly][lx][1] = get_pix_bhwc(img2, bIdx, c, gy, gx, CH, H, W);
                 }
+            }
+        }
+        block.sync();
+
+        // 2) Horizontal convolution
+        {
+            int ly = threadIdx.y;
+            int lx = threadIdx.x + HALO;
+
+            float sumX = 0.f, sumX2 = 0.f, sumY = 0.f, sumY2 = 0.f, sumXY = 0.f;
+
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d) {
+                float w  = cGauss[HALO - d];
+                float Xl = sTile[ly][lx - d][0];
+                float Yl = sTile[ly][lx - d][1];
+                float Xr = sTile[ly][lx + d][0];
+                float Yr = sTile[ly][lx + d][1];
+
+                sumX  += (Xl + Xr) * w;
+                sumX2 += (Xl * Xl + Xr * Xr) * w;
+                sumY  += (Yl + Yr) * w;
+                sumY2 += (Yl * Yl + Yr * Yr) * w;
+                sumXY += (Xl * Yl + Xr * Yr) * w;
             }
             {
+                float X = sTile[ly][lx][0];
+                float Y = sTile[ly][lx][1];
                 float wc = cGauss[HALO];
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    float X = sTile[ly2][lx][0][c];
-                    float Y = sTile[ly2][lx][1][c];
-                    sumX[c]  += X * wc;
-                    sumX2[c] += X*X * wc;
-                    sumY[c]  += Y * wc;
-                    sumY2[c] += Y*Y * wc;
-                    sumXY[c] += X*Y * wc;
+                sumX  += X * wc;
+                sumX2 += (X * X) * wc;
+                sumY  += Y * wc;
+                sumY2 += (Y * Y) * wc;
+                sumXY += (X * Y) * wc;
+            }
+            xconv[ly][threadIdx.x][0] = sumX;
+            xconv[ly][threadIdx.x][1] = sumX2;
+            xconv[ly][threadIdx.x][2] = sumY;
+            xconv[ly][threadIdx.x][3] = sumY2;
+            xconv[ly][threadIdx.x][4] = sumXY;
+
+            int ly2 = ly + BLOCK_Y;
+            if (ly2 < CONV_Y) {
+                sumX = 0.f; sumX2 = 0.f; sumY = 0.f; sumY2 = 0.f; sumXY = 0.f;
+#pragma unroll
+                for (int d = 1; d <= HALO; ++d) {
+                    float w  = cGauss[HALO - d];
+                    float Xl = sTile[ly2][lx - d][0];
+                    float Yl = sTile[ly2][lx - d][1];
+                    float Xr = sTile[ly2][lx + d][0];
+                    float Yr = sTile[ly2][lx + d][1];
+
+                    sumX  += (Xl + Xr) * w;
+                    sumX2 += (Xl * Xl + Xr * Xr) * w;
+                    sumY  += (Yl + Yr) * w;
+                    sumY2 += (Yl * Yl + Yr * Yr) * w;
+                    sumXY += (Xl * Yl + Xr * Yr) * w;
                 }
-            }
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                xconv[ly2][threadIdx.x][0][c] = sumX[c];
-                xconv[ly2][threadIdx.x][1][c] = sumX2[c];
-                xconv[ly2][threadIdx.x][2][c] = sumY[c];
-                xconv[ly2][threadIdx.x][3][c] = sumY2[c];
-                xconv[ly2][threadIdx.x][4][c] = sumXY[c];
-            }
-        }
-    }
-    block.sync();
-
-    // 3) Vertical convolution + SSIM — channel innermost
-    {
-        int ly = threadIdx.y + HALO;
-        int lx = threadIdx.x;
-
-        float out[5][CH];
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            out[0][c] = 0.f; out[1][c] = 0.f; out[2][c] = 0.f;
-            out[3][c] = 0.f; out[4][c] = 0.f;
-        }
-
-        #pragma unroll
-        for (int d = 1; d <= HALO; ++d) {
-            float w = cGauss[HALO - d];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                #pragma unroll
-                for (int k = 0; k < 5; ++k)
-                    out[k][c] += (xconv[ly - d][lx][k][c] + xconv[ly + d][lx][k][c]) * w;
+                {
+                    float X = sTile[ly2][lx][0];
+                    float Y = sTile[ly2][lx][1];
+                    float wc = cGauss[HALO];
+                    sumX  += X * wc;
+                    sumX2 += (X * X) * wc;
+                    sumY  += Y * wc;
+                    sumY2 += (Y * Y) * wc;
+                    sumXY += (X * Y) * wc;
+                }
+                xconv[ly2][threadIdx.x][0] = sumX;
+                xconv[ly2][threadIdx.x][1] = sumX2;
+                xconv[ly2][threadIdx.x][2] = sumY;
+                xconv[ly2][threadIdx.x][3] = sumY2;
+                xconv[ly2][threadIdx.x][4] = sumXY;
             }
         }
+        block.sync();
+
+        // 3) Vertical convolution + SSIM
         {
-            float wC = cGauss[HALO];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                #pragma unroll
-                for (int k = 0; k < 5; ++k)
-                    out[k][c] += xconv[ly][lx][k][c] * wC;
+            int ly = threadIdx.y + HALO;
+            int lx = threadIdx.x;
+
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f, o4 = 0.f;
+
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d) {
+                float w = cGauss[HALO - d];
+                float* top = xconv[ly - d][lx];
+                float* bot = xconv[ly + d][lx];
+                o0 += (top[0] + bot[0]) * w;
+                o1 += (top[1] + bot[1]) * w;
+                o2 += (top[2] + bot[2]) * w;
+                o3 += (top[3] + bot[3]) * w;
+                o4 += (top[4] + bot[4]) * w;
             }
-        }
+            {
+                float wC = cGauss[HALO];
+                float* ctr = xconv[ly][lx];
+                o0 += ctr[0] * wC;
+                o1 += ctr[1] * wC;
+                o2 += ctr[2] * wC;
+                o3 += ctr[3] * wC;
+                o4 += ctr[4] * wC;
+            }
 
-        if (pix_x < W && pix_y < H) {
-            int base_idx = bIdx * num_pix * CH + pix_id * CH;
-
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                float mu1 = out[0][c];
-                float mu2 = out[2][c];
+            if (pix_x < W && pix_y < H) {
+                float mu1 = o0;
+                float mu2 = o2;
                 float mu1_sq = mu1 * mu1;
                 float mu2_sq = mu2 * mu2;
-                float sigma1_sq = fmaxf(0.0f, out[1][c] - mu1_sq);
-                float sigma2_sq = fmaxf(0.0f, out[3][c] - mu2_sq);
-                float sigma12   = out[4][c] - mu1 * mu2;
+                float sigma1_sq = fmaxf(0.0f, o1 - mu1_sq);
+                float sigma2_sq = fmaxf(0.0f, o3 - mu2_sq);
+                float sigma12   = o4 - mu1 * mu2;
 
                 float A  = mu1_sq + mu2_sq + C1;
                 float B  = sigma1_sq + sigma2_sq + C2;
@@ -234,9 +208,13 @@ __global__ void fusedssimCUDA(
                 bool clamped = (val < -1.0f || val > 1.0f);
                 val = fmaxf(-1.0f, fminf(1.0f, val));
 
-                ssim_map[base_idx + c] = val;
+                // Output SSIM map in BHWC layout
+                int bhwc_idx = bIdx * num_pix * CH + pix_id * CH + c;
+                ssim_map[bhwc_idx] = val;
 
+                // Store derivatives in BCHW layout for efficient backward reads
                 if (dm_dmu1) {
+                    int bchw_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
                     float d_mu1 = clamped ? 0.0f : (
                         (mu2 * 2.f * D_) / (A * B)
                         - (mu2 * 2.f * C_) / (A * B)
@@ -246,18 +224,18 @@ __global__ void fusedssimCUDA(
                     float d_s1  = clamped ? 0.0f : (-C_ * D_) / (A * B * B);
                     float d_s12 = clamped ? 0.0f : (2.f * C_) / (A * B);
 
-                    dm_dmu1[base_idx + c]       = d_mu1;
-                    dm_dsigma1_sq[base_idx + c] = d_s1;
-                    dm_dsigma12[base_idx + c]   = d_s12;
+                    dm_dmu1[bchw_idx]       = d_mu1;
+                    dm_dsigma1_sq[bchw_idx] = d_s1;
+                    dm_dsigma12[bchw_idx]   = d_s12;
                 }
             }
         }
+        block.sync();
     }
 }
 
-template<int CH>
 __global__ void fusedssim_backwardCUDA(
-    int H, int W,
+    int H, int W, int CH,
     float C1, float C2,
     const float* __restrict__ img1,
     const float* __restrict__ img2,
@@ -274,162 +252,100 @@ __global__ void fusedssim_backwardCUDA(
     const int num_pix = H * W;
     const int bIdx   = block.group_index().z;
 
-    __shared__ float sData[SHARED_Y][SHARED_X][3][CH];
-    __shared__ float sScratch[CONV_Y][CONV_X][3][CH];
+    __shared__ float sData[3][SHARED_Y][SHARED_X];
+    __shared__ float sScratch[CONV_Y][CONV_X][3];
 
-    float p1[CH], p2[CH];
-    if (pix_x < W && pix_y < H) {
-        const float* b1 = img1 + bIdx * num_pix * CH + pix_id * CH;
-        const float* b2 = img2 + bIdx * num_pix * CH + pix_id * CH;
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) { p1[c] = b1[c]; p2[c] = b2[c]; }
-    } else {
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) { p1[c] = 0.f; p2[c] = 0.f; }
-    }
-
-    // 1) Load + fuse multiplication — all channels coalesced
-    {
-        const int startY = block.group_index().y * BLOCK_Y;
-        const int startX = block.group_index().x * BLOCK_X;
-        int tid = threadIdx.y * blockDim.x + threadIdx.x;
-        int warp_id = tid / 32;
-        int lane_id = tid % 32;
-        int totalThreads = BLOCK_X * BLOCK_Y;
-        int num_warps = (totalThreads + 31) / 32;
-
-        const float* base_dL  = dL_dmap       + bIdx * num_pix * CH;
-        const float* base_mu  = dm_dmu1       + bIdx * num_pix * CH;
-        const float* base_s1  = dm_dsigma1_sq + bIdx * num_pix * CH;
-        const float* base_s12 = dm_dsigma12   + bIdx * num_pix * CH;
-
-        for (int row = warp_id; row < SHARED_Y; row += num_warps) {
-            int gy = startY + row - HALO;
-            for (int col = lane_id; col < SHARED_X; col += 32) {
-                int gx = startX + col - HALO;
-                bool valid = (gx >= 0 && gx < W && gy >= 0 && gy < H);
-                int idx = gy * W * CH + gx * CH;
-
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    float chain = valid ? base_dL[idx + c]  : 0.0f;
-                    float vmu   = valid ? base_mu[idx + c]  : 0.0f;
-                    float vs1   = valid ? base_s1[idx + c]  : 0.0f;
-                    float vs12  = valid ? base_s12[idx + c] : 0.0f;
-                    sData[row][col][0][c] = vmu  * chain;
-                    sData[row][col][1][c] = vs1  * chain;
-                    sData[row][col][2][c] = vs12 * chain;
-                }
-            }
-        }
-    }
-    block.sync();
-
-    // 2) Horizontal pass — channel innermost
-    {
-        int ly = threadIdx.y;
-        int lx = threadIdx.x + HALO;
-
-        for (int pass = 0; pass < 2; ++pass) {
-            int yy = ly + pass * BLOCK_Y;
-            if (yy < CONV_Y) {
-                float accum[3][CH];
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    accum[0][c] = 0.f; accum[1][c] = 0.f; accum[2][c] = 0.f;
-                }
-
-                #pragma unroll
-                for (int d = 1; d <= HALO; ++d) {
-                    float w = cGauss[HALO - d];
-                    #pragma unroll
-                    for (int c = 0; c < CH; ++c) {
-                        #pragma unroll
-                        for (int k = 0; k < 3; ++k)
-                            accum[k][c] += (sData[yy][lx - d][k][c] + sData[yy][lx + d][k][c]) * w;
-                    }
-                }
-                {
-                    float wc = cGauss[HALO];
-                    #pragma unroll
-                    for (int c = 0; c < CH; ++c) {
-                        #pragma unroll
-                        for (int k = 0; k < 3; ++k)
-                            accum[k][c] += sData[yy][lx][k][c] * wc;
-                    }
-                }
-
-                #pragma unroll
-                for (int c = 0; c < CH; ++c) {
-                    sScratch[yy][threadIdx.x][0][c] = accum[0][c];
-                    sScratch[yy][threadIdx.x][1][c] = accum[1][c];
-                    sScratch[yy][threadIdx.x][2][c] = accum[2][c];
-                }
-            }
-        }
-    }
-    block.sync();
-
-    // 3) Vertical pass + output — channel innermost
-    if (pix_x < W && pix_y < H) {
-        int ly = threadIdx.y + HALO;
-        int lx = threadIdx.x;
-
-        float sum[3][CH];
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            sum[0][c] = 0.f; sum[1][c] = 0.f; sum[2][c] = 0.f;
+    for (int c = 0; c < CH; ++c) {
+        float p1 = 0.f, p2 = 0.f;
+        if (pix_x < W && pix_y < H) {
+            p1 = get_pix_bhwc(img1, bIdx, c, pix_y, pix_x, CH, H, W);
+            p2 = get_pix_bhwc(img2, bIdx, c, pix_y, pix_x, CH, H, W);
         }
 
-        #pragma unroll
-        for (int d = 1; d <= HALO; ++d) {
-            float w = cGauss[HALO - d];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                #pragma unroll
-                for (int k = 0; k < 3; ++k)
-                    sum[k][c] += (sScratch[ly - d][lx][k][c] + sScratch[ly + d][lx][k][c]) * w;
-            }
-        }
+        // 1) Load tile: dL_dmap from BHWC, derivatives from BCHW (coalesced)
         {
-            float wc = cGauss[HALO];
-            #pragma unroll
-            for (int c = 0; c < CH; ++c) {
-                #pragma unroll
-                for (int k = 0; k < 3; ++k)
-                    sum[k][c] += sScratch[ly][lx][k][c] * wc;
+            const int startY = block.group_index().y * BLOCK_Y;
+            const int startX = block.group_index().x * BLOCK_X;
+
+            int tid = threadIdx.y * blockDim.x + threadIdx.x;
+            int warp_id  = tid / 32;
+            int lane_id  = tid % 32;
+            int num_warps = (BLOCK_X * BLOCK_Y + 31) / 32;
+
+            for (int row = warp_id; row < SHARED_Y; row += num_warps) {
+                int gy = startY + row - HALO;
+                for (int col = lane_id; col < SHARED_X; col += 32) {
+                    int gx = startX + col - HALO;
+
+                    float chain = get_pix_bhwc(dL_dmap, bIdx, c, gy, gx, CH, H, W);
+                    float vmu   = get_pix_bchw(dm_dmu1,       bIdx, c, gy, gx, CH, H, W);
+                    float vs1   = get_pix_bchw(dm_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
+                    float vs12  = get_pix_bchw(dm_dsigma12,   bIdx, c, gy, gx, CH, H, W);
+
+                    sData[0][row][col] = vmu  * chain;
+                    sData[1][row][col] = vs1  * chain;
+                    sData[2][row][col] = vs12 * chain;
+                }
             }
         }
+        block.sync();
 
-        int base_idx = bIdx * num_pix * CH + pix_id * CH;
-        #pragma unroll
-        for (int c = 0; c < CH; ++c) {
-            dL_dimg1[base_idx + c] = sum[0][c] + (2.f * p1[c]) * sum[1][c] + p2[c] * sum[2][c];
+        // 2) Horizontal convolution
+        {
+            int ly = threadIdx.y;
+            int lx = threadIdx.x + HALO;
+
+            for (int pass = 0; pass < 2; ++pass) {
+                int yy = ly + pass * BLOCK_Y;
+                if (yy < CONV_Y) {
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+#pragma unroll
+                    for (int d = 1; d <= HALO; ++d) {
+                        float w = cGauss[HALO - d];
+                        a0 += (sData[0][yy][lx - d] + sData[0][yy][lx + d]) * w;
+                        a1 += (sData[1][yy][lx - d] + sData[1][yy][lx + d]) * w;
+                        a2 += (sData[2][yy][lx - d] + sData[2][yy][lx + d]) * w;
+                    }
+                    {
+                        float wc = cGauss[HALO];
+                        a0 += sData[0][yy][lx] * wc;
+                        a1 += sData[1][yy][lx] * wc;
+                        a2 += sData[2][yy][lx] * wc;
+                    }
+                    sScratch[yy][threadIdx.x][0] = a0;
+                    sScratch[yy][threadIdx.x][1] = a1;
+                    sScratch[yy][threadIdx.x][2] = a2;
+                }
+            }
         }
+        block.sync();
+
+        // 3) Vertical convolution + output in BHWC
+        if (pix_x < W && pix_y < H) {
+            int ly = threadIdx.y + HALO;
+            int lx = threadIdx.x;
+
+            float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+#pragma unroll
+            for (int d = 1; d <= HALO; ++d) {
+                float w = cGauss[HALO - d];
+                s0 += (sScratch[ly - d][lx][0] + sScratch[ly + d][lx][0]) * w;
+                s1 += (sScratch[ly - d][lx][1] + sScratch[ly + d][lx][1]) * w;
+                s2 += (sScratch[ly - d][lx][2] + sScratch[ly + d][lx][2]) * w;
+            }
+            {
+                float wc = cGauss[HALO];
+                s0 += sScratch[ly][lx][0] * wc;
+                s1 += sScratch[ly][lx][1] * wc;
+                s2 += sScratch[ly][lx][2] * wc;
+            }
+
+            int bhwc_idx = bIdx * num_pix * CH + pix_id * CH + c;
+            dL_dimg1[bhwc_idx] = s0 + (2.f * p1) * s1 + p2 * s2;
+        }
+        block.sync();
     }
 }
-
-// Dispatch helper
-#define LAUNCH_FWD(CH_VAL) \
-    fusedssimCUDA<CH_VAL><<<grid, block, 0, stream>>>( \
-        H, W, C1, C2, \
-        img1.contiguous().data_ptr<float>(), \
-        img2.contiguous().data_ptr<float>(), \
-        ssim_map.data_ptr<float>(), \
-        train ? dm_dmu1.data_ptr<float>()       : nullptr, \
-        train ? dm_dsigma1_sq.data_ptr<float>() : nullptr, \
-        train ? dm_dsigma12.data_ptr<float>()   : nullptr)
-
-#define LAUNCH_BWD(CH_VAL) \
-    fusedssim_backwardCUDA<CH_VAL><<<grid, block, 0, stream>>>( \
-        H, W, C1, C2, \
-        img1.contiguous().data_ptr<float>(), \
-        img2.contiguous().data_ptr<float>(), \
-        dL_dmap.contiguous().data_ptr<float>(), \
-        dL_dimg1.data_ptr<float>(), \
-        dm_dmu1.contiguous().data_ptr<float>(), \
-        dm_dsigma1_sq.contiguous().data_ptr<float>(), \
-        dm_dsigma12.contiguous().data_ptr<float>())
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 fusedssim(
@@ -448,17 +364,22 @@ fusedssim(
               (H + BLOCK_Y - 1) / BLOCK_Y, B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    auto ssim_map      = torch::zeros_like(img1).contiguous();
-    auto dm_dmu1       = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
-    auto dm_dsigma1_sq = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
-    auto dm_dsigma12   = train ? torch::zeros_like(img1) : torch::empty({0}, img1.options());
+    auto ssim_map = torch::zeros_like(img1).contiguous();
 
-    switch (CH) {
-        case 1: LAUNCH_FWD(1); break;
-        case 3: LAUNCH_FWD(3); break;
-        case 4: LAUNCH_FWD(4); break;
-        default: TORCH_CHECK(false, "fused_ssim_bhwc: unsupported channel count ", CH);
-    }
+    // Derivative maps stored in BCHW layout for coalesced backward reads
+    auto dm_dmu1       = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+    auto dm_dsigma1_sq = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+    auto dm_dsigma12   = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+
+    fusedssimCUDA<<<grid, block, 0, stream>>>(
+        H, W, CH, C1, C2,
+        img1.contiguous().data_ptr<float>(),
+        img2.contiguous().data_ptr<float>(),
+        ssim_map.data_ptr<float>(),
+        train ? dm_dmu1.data_ptr<float>()       : nullptr,
+        train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
+        train ? dm_dsigma12.data_ptr<float>()   : nullptr
+    );
 
     return std::make_tuple(ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
 }
@@ -485,12 +406,16 @@ fusedssim_backward(
               (H + BLOCK_Y - 1) / BLOCK_Y, B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    switch (CH) {
-        case 1: LAUNCH_BWD(1); break;
-        case 3: LAUNCH_BWD(3); break;
-        case 4: LAUNCH_BWD(4); break;
-        default: TORCH_CHECK(false, "fused_ssim_bhwc: unsupported channel count ", CH);
-    }
+    fusedssim_backwardCUDA<<<grid, block, 0, stream>>>(
+        H, W, CH, C1, C2,
+        img1.contiguous().data_ptr<float>(),
+        img2.contiguous().data_ptr<float>(),
+        dL_dmap.contiguous().data_ptr<float>(),
+        dL_dimg1.data_ptr<float>(),
+        dm_dmu1.contiguous().data_ptr<float>(),
+        dm_dsigma1_sq.contiguous().data_ptr<float>(),
+        dm_dsigma12.contiguous().data_ptr<float>()
+    );
 
     return dL_dimg1;
 }
