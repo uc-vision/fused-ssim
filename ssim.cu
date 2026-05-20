@@ -208,11 +208,9 @@ __global__ void fusedssimCUDA(
                 bool clamped = (val < -1.0f || val > 1.0f);
                 val = fmaxf(-1.0f, fminf(1.0f, val));
 
-                // Output SSIM map in BHWC layout
                 int bhwc_idx = bIdx * num_pix * CH + pix_id * CH + c;
                 ssim_map[bhwc_idx] = val;
 
-                // Store derivatives in BCHW layout for efficient backward reads
                 if (dm_dmu1) {
                     int bchw_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
                     float d_mu1 = clamped ? 0.0f : (
@@ -364,17 +362,16 @@ fusedssim(
               (H + BLOCK_Y - 1) / BLOCK_Y, B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    auto ssim_map = torch::zeros_like(img1).contiguous();
+    auto ssim_map = torch::empty_like(img1);
 
-    // Derivative maps stored in BCHW layout for coalesced backward reads
-    auto dm_dmu1       = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
-    auto dm_dsigma1_sq = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
-    auto dm_dsigma12   = train ? torch::zeros({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+    auto dm_dmu1       = train ? torch::empty({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+    auto dm_dsigma1_sq = train ? torch::empty({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
+    auto dm_dsigma12   = train ? torch::empty({B, CH, H, W}, img1.options()) : torch::empty({0}, img1.options());
 
     fusedssimCUDA<<<grid, block, 0, stream>>>(
         H, W, CH, C1, C2,
-        img1.contiguous().data_ptr<float>(),
-        img2.contiguous().data_ptr<float>(),
+        img1.data_ptr<float>(),
+        img2.data_ptr<float>(),
         ssim_map.data_ptr<float>(),
         train ? dm_dmu1.data_ptr<float>()       : nullptr,
         train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
@@ -400,7 +397,7 @@ fusedssim_backward(
     int W  = img1.size(2);
     int CH = img1.size(3);
 
-    auto dL_dimg1 = torch::zeros_like(img1);
+    auto dL_dimg1 = torch::empty_like(img1);
 
     dim3 grid((W + BLOCK_X - 1) / BLOCK_X,
               (H + BLOCK_Y - 1) / BLOCK_Y, B);

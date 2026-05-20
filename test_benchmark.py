@@ -172,7 +172,7 @@ def run_benchmarks():
     print("\n=== Benchmarks ===")
     print(f"  GPU: {torch.cuda.get_device_name()}")
     print(f"  {'Resolution':>15}  {'Fwd (ms)':>10}  {'Fwd+Bwd (ms)':>14}")
-    print(f"  {'-'*15}  {'-'*10}  {'-'*14}")
+    print(f"  {'-' * 15}  {'-' * 10}  {'-' * 14}")
 
     for h, w, ch in [
         (480, 640, 3),

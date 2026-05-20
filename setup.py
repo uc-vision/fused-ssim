@@ -74,7 +74,7 @@ def configure_mps():
     log("Compiling for MPS.")
     compiler_args = {"cxx": ["-O3", "-std=c++17", "-ObjC++", "-Wno-unused-parameter"]}
     link_args = ["-framework", "Metal", "-framework", "Foundation"]
-    return CppExtension, ["ssim.mm","ext.cpp"], "fused_ssim_mps", compiler_args, link_args, "Apple Silicon (MPS)"
+    return CppExtension, ["ssim.mm", "ext.cpp"], "fused_ssim_mps", compiler_args, link_args, "Apple Silicon (MPS)"
 
 
 def configure_xpu():
@@ -93,7 +93,7 @@ def configure_xpu():
         log("Detected Intel XPU (SYCL)")
         detected_arch = "Intel XPU (SYCL)"
 
-    return CppExtension, ["ssim_sycl.cpp","ext.cpp"], "fused_ssim_xpu", compiler_args, link_args, detected_arch
+    return CppExtension, ["ssim_sycl.cpp", "ext.cpp"], "fused_ssim_xpu", compiler_args, link_args, detected_arch
 
 
 # Detect backend
@@ -106,6 +106,7 @@ elif hasattr(torch, 'xpu') and torch.xpu.is_available():
 else:
     extension_type, extension_files, build_name, compiler_args, link_args, detected_arch = configure_cuda()
 
+
 # Create a custom class that prints the architecture information
 class CustomBuildExtension(BuildExtension):
     def build_extensions(self):
@@ -115,11 +116,12 @@ class CustomBuildExtension(BuildExtension):
             self.compiler.compiler_cxx = ['icpx'] + self.compiler.compiler_cxx[1:]
             self.compiler.linker_so = ['icpx'] + self.compiler.linker_so[1:]
 
-        arch_info = f"Building with GPU architecture: {detected_arch if detected_arch else 'multiple architectures'}"
-        print("\n" + "="*50)
+        arch_info = f"Building with GPU architecture: {detected_arch or 'multiple architectures'}"
+        print("\n" + "=" * 50)
         print(arch_info)
-        print("="*50 + "\n")
+        print("=" * 50 + "\n")
         super().build_extensions()
+
 
 setup(
     name="fused_ssim_bhwc",

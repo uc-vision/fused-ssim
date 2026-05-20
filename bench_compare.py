@@ -111,7 +111,7 @@ print()
 print(f"GPU: {torch.cuda.get_device_name()}\n")
 print(f"{'Resolution':>15}  {'BCHW fwd':>10}  {'BHWC fwd':>10}  {'speedup':>8}  "
       f"{'BCHW f+b':>10}  {'BHWC f+b':>10}  {'speedup':>8}")
-print(f"{'-'*15}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*8}")
+print(f"{'-' * 15}  {'-' * 10}  {'-' * 10}  {'-' * 8}  {'-' * 10}  {'-' * 10}  {'-' * 8}")
 
 for h, w in [(480, 640), (720, 1280), (1080, 1920), (1440, 2560)]:
     ch = 3
@@ -123,5 +123,5 @@ for h, w in [(480, 640), (720, 1280), (1080, 1920), (1440, 2560)]:
     img2_bchw = img2_bhwc.permute(0, 3, 1, 2).contiguous()
     bchw_fwd, bchw_fb = bench(AutogradBCHW.apply, img1_bchw, img2_bchw)
 
-    print(f"  {h}x{w}x{ch}  {bchw_fwd:10.3f}  {bhwc_fwd:10.3f}  {bchw_fwd/bhwc_fwd:7.2f}x  "
-          f"{bchw_fb:10.3f}  {bhwc_fb:10.3f}  {bchw_fb/bhwc_fb:7.2f}x")
+    print(f"  {h}x{w}x{ch}  {bchw_fwd:10.3f}  {bhwc_fwd:10.3f}  {bchw_fwd / bhwc_fwd:7.2f}x  "
+          f"{bchw_fb:10.3f}  {bhwc_fb:10.3f}  {bchw_fb / bhwc_fb:7.2f}x")

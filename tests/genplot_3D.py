@@ -50,7 +50,7 @@ if __name__ == "__main__":
     for d in dimensions:
         with torch.no_grad():
             img1_og = torch.rand([B, CH, d, d, d], device=fused_ssim_device)
-            img2_og = torch.rand([B, CH, d,d, d], device=fused_ssim_device)
+            img2_og = torch.rand([B, CH, d, d, d], device=fused_ssim_device)
 
             img1_mine_same = torch.nn.Parameter(img1_og.clone())
             img2_mine_same = img2_og.clone()
