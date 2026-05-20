@@ -48,7 +48,7 @@ __device__ __forceinline__ float get_pix_value(
     if (x < 0 || x >= W || y < 0 || y >= H) {
         return 0.0f;
     }
-    return img[b * CH * H * W + c * H * W + y * W + x];
+    return img[b * H * W * CH + y * W * CH + x * CH + c];
 }
 
 // ------------------------------------------
@@ -256,11 +256,10 @@ __global__ void fusedssimCUDA(
                 bool clamped = (val < -1.0f || val > 1.0f);
                 val = fmaxf(-1.0f, fminf(1.0f, val));
 
-                int global_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
+                int global_idx = bIdx * num_pix * CH + pix_id * CH + c;
                 ssim_map[global_idx] = val;
 
                 if (dm_dmu1) {
-                    // partial derivatives (zero if clamped)
                     float d_m_dmu1 = clamped ? 0.0f : (
                         (mu2 * 2.f * D_) / (A * B)
                         - (mu2 * 2.f * C_) / (A * B)
@@ -421,7 +420,7 @@ __global__ void fusedssim_backwardCUDA(
             // final accumulation
             float dL_dpix = sum0 + (2.f * p1) * sum1 + (p2) * sum2;
 
-            int out_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
+            int out_idx = bIdx * num_pix * CH + pix_id * CH + c;
             dL_dimg1[out_idx] = dL_dpix;
         }
         block.sync();
@@ -444,17 +443,15 @@ fusedssim(
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
     auto stream = at::cuda::getCurrentCUDAStream();
     int B  = img1.size(0);
-    int CH = img1.size(1);
-    int H  = img1.size(2);
-    int W  = img1.size(3);
+    int H  = img1.size(1);
+    int W  = img1.size(2);
+    int CH = img1.size(3);
 
-    // Launch config
     dim3 grid((W + BLOCK_X - 1) / BLOCK_X,
               (H + BLOCK_Y - 1) / BLOCK_Y,
               B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    // Output SSIM map
     auto ssim_map = torch::zeros_like(img1, img1.options()).contiguous();
 
     // Optionally allocate derivative Tensors
@@ -495,9 +492,9 @@ fusedssim_backward(
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
     auto stream = at::cuda::getCurrentCUDAStream();
     int B  = img1.size(0);
-    int CH = img1.size(1);
-    int H  = img1.size(2);
-    int W  = img1.size(3);
+    int H  = img1.size(1);
+    int W  = img1.size(2);
+    int CH = img1.size(3);
 
     auto dL_dimg1 = torch::zeros_like(img1);
 
