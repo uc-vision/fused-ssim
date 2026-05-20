@@ -122,8 +122,8 @@ class CustomBuildExtension(BuildExtension):
         super().build_extensions()
 
 setup(
-    name="fused_ssim",
-    packages=['fused_ssim'],
+    name="fused_ssim_bhwc",
+    packages=['fused_ssim_bhwc'],
     ext_modules=[
         extension_type(
             name=build_name,

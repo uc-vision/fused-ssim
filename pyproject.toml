@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fused-ssim"
+name = "fused-ssim-bhwc"
 version = "1.0.2"
 description = "Efficient fully-fused differentiable SSIM implementation"
 readme = "README.md"
@@ -16,4 +16,4 @@ Homepage = "https://github.com/rahul-goel/fused-ssim"
 Repository = "https://github.com/rahul-goel/fused-ssim"
 
 [tool.setuptools]
-packages = ["fused_ssim"]
+packages = ["fused_ssim_bhwc"]
