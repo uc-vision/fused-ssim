@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fused-ssim-bhwc"
-version = "1.0.7"
+version = "1.0.11"
 description = "Efficient fully-fused differentiable SSIM implementation"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -17,3 +17,6 @@ Repository = "https://github.com/rahul-goel/fused-ssim"
 
 [tool.setuptools]
 packages = ["fused_ssim_bhwc"]
+
+[tool.setuptools.package-data]
+fused_ssim_bhwc = ["__init__.pyi", "py.typed"]

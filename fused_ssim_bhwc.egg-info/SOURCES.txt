@@ -1,6 +1,7 @@
 .gitignore
 LICENSE
 README.md
+bench_compare.py
 ext.cpp
 pyproject.toml
 setup.py
@@ -10,7 +11,10 @@ ssim.mm
 ssim3d.cu
 ssim3d.h
 ssim_sycl.cpp
+test_benchmark.py
 fused_ssim_bhwc/__init__.py
+fused_ssim_bhwc/__init__.pyi
+fused_ssim_bhwc/py.typed
 fused_ssim_bhwc.egg-info/PKG-INFO
 fused_ssim_bhwc.egg-info/SOURCES.txt
 fused_ssim_bhwc.egg-info/dependency_links.txt
@@ -39,5 +43,6 @@ tests/genplot.py
 tests/genplot_3D.py
 tests/test.py
 tests/test_3D.py
+tests/test_decoupled_bhwc.py
 tests/train_image.py
 tests/train_image_3D.py

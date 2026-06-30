@@ -15,6 +15,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // 2D SSIM (available on all backends)
   m.def("fusedssim", &fusedssim, call_guard<gil_scoped_release>());
   m.def("fusedssim_backward", &fusedssim_backward, call_guard<gil_scoped_release>());
+  m.def("decoupled_fusedssim", &decoupled_fusedssim, call_guard<gil_scoped_release>());
+  m.def("decoupled_fusedssim_backward", &decoupled_fusedssim_backward, call_guard<gil_scoped_release>());
 
   // 3D SSIM (CUDA only for now)
 #ifdef FUSED_SSIM_CUDA

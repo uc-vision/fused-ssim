@@ -126,6 +126,7 @@ class CustomBuildExtension(BuildExtension):
 setup(
     name="fused_ssim_bhwc",
     packages=['fused_ssim_bhwc'],
+    package_data={"fused_ssim_bhwc": ["__init__.pyi", "py.typed"]},
     ext_modules=[
         extension_type(
             name=build_name,

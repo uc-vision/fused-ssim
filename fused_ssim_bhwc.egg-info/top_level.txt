@@ -1,2 +1,2 @@
 fused_ssim_bhwc
-fused_ssim_cuda
+fused_ssim_bhwc_cuda
