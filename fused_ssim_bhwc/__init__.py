@@ -66,6 +66,9 @@ class DecoupledFusedSSIMMap(torch.autograd.Function):
         img1 = img1.contiguous()
         img2 = img2.contiguous()
         img3 = img3.contiguous()
+        need_img1 = train and ctx.needs_input_grad[2]
+        need_img2 = train and ctx.needs_input_grad[3]
+        need_img3 = train and ctx.needs_input_grad[4]
         (
             luminance_map,
             contrast_structure_map,
@@ -75,23 +78,27 @@ class DecoupledFusedSSIMMap(torch.autograd.Function):
             dcs_dmu2,
             dcs_dsigma1_sq,
             dcs_dsigma12,
-        ) = decoupled_fusedssim(C1, C2, img1, img2, img3, train)
+        ) = decoupled_fusedssim(C1, C2, img1, img2, img3, need_img1, need_img2, need_img3)
 
         if padding == "valid":
             luminance_map = luminance_map[:, 5:-5, 5:-5, :]
             contrast_structure_map = contrast_structure_map[:, 5:-5, 5:-5, :]
 
+        derivative_maps = (
+            (dl_dmu1, need_img1),
+            (dl_dmu3, need_img3),
+            (dcs_dmu1, need_img1),
+            (dcs_dmu2, need_img2),
+            (dcs_dsigma1_sq, need_img1 or need_img2),
+            (dcs_dsigma12, need_img1 or need_img2),
+        )
         ctx.save_for_backward(
             img1.detach(),
             img2,
             img3,
-            dl_dmu1,
-            dl_dmu3,
-            dcs_dmu1,
-            dcs_dmu2,
-            dcs_dsigma1_sq,
-            dcs_dsigma12,
+            *(derivative for derivative, needed in derivative_maps if needed),
         )
+        ctx.image_gradients = need_img1, need_img2, need_img3
         ctx.C1 = C1
         ctx.C2 = C2
         ctx.padding = padding
@@ -100,35 +107,20 @@ class DecoupledFusedSSIMMap(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_luminance, grad_contrast_structure):
-        (
-            img1,
-            img2,
-            img3,
-            dl_dmu1,
-            dl_dmu3,
-            dcs_dmu1,
-            dcs_dmu2,
-            dcs_dsigma1_sq,
-            dcs_dsigma12,
-        ) = ctx.saved_tensors
+        saved_tensors = iter(ctx.saved_tensors)
+        img1 = next(saved_tensors)
+        img2 = next(saved_tensors)
+        img3 = next(saved_tensors)
+        need_img1, need_img2, need_img3 = ctx.image_gradients
         C1, C2, padding = ctx.C1, ctx.C2, ctx.padding
 
-        dL_dluminance = grad_luminance
-        dL_dcontrast_structure = grad_contrast_structure
-        if padding == "valid":
-            dL_dluminance = torch.zeros_like(img1)
-            dL_dcontrast_structure = torch.zeros_like(img1)
-            dL_dluminance[:, 5:-5, 5:-5, :] = grad_luminance
-            dL_dcontrast_structure[:, 5:-5, 5:-5, :] = grad_contrast_structure
-
-        empty = dl_dmu1.new_empty((0,))
-        if not ctx.needs_input_grad[2]:
-            dl_dmu1 = empty
-            dcs_dmu1 = empty
-        if not ctx.needs_input_grad[3]:
-            dcs_dmu2 = empty
-        if not ctx.needs_input_grad[4]:
-            dl_dmu3 = empty
+        empty = img1.new_empty((0,))
+        dl_dmu1 = next(saved_tensors) if need_img1 else empty
+        dl_dmu3 = next(saved_tensors) if need_img3 else empty
+        dcs_dmu1 = next(saved_tensors) if need_img1 else empty
+        dcs_dmu2 = next(saved_tensors) if need_img2 else empty
+        dcs_dsigma1_sq = next(saved_tensors) if need_img1 or need_img2 else empty
+        dcs_dsigma12 = next(saved_tensors) if need_img1 or need_img2 else empty
 
         grad_img1, grad_img2, grad_img3 = decoupled_fusedssim_backward(
             C1,
@@ -136,14 +128,15 @@ class DecoupledFusedSSIMMap(torch.autograd.Function):
             img1,
             img2,
             img3,
-            dL_dluminance,
-            dL_dcontrast_structure,
+            grad_luminance,
+            grad_contrast_structure,
             dl_dmu1,
             dl_dmu3,
             dcs_dmu1,
             dcs_dmu2,
             dcs_dsigma1_sq,
             dcs_dsigma12,
+            5 if padding == "valid" else 0,
         )
 
         if not ctx.needs_input_grad[2]:

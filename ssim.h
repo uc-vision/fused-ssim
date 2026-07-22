@@ -34,7 +34,9 @@ decoupled_fusedssim(
     torch::Tensor &img1,
     torch::Tensor &img2,
     torch::Tensor &img3,
-    bool train
+    bool need_img1,
+    bool need_img2,
+    bool need_img3
 );
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -51,5 +53,6 @@ decoupled_fusedssim_backward(
     torch::Tensor &dcs_dmu1,
     torch::Tensor &dcs_dmu2,
     torch::Tensor &dcs_dsigma1_sq,
-    torch::Tensor &dcs_dsigma12
+    torch::Tensor &dcs_dsigma12,
+    int gradient_padding
 );

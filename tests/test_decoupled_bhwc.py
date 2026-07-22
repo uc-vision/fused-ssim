@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fused_ssim_bhwc import decoupled_fused_ssim
+from fused_ssim_bhwc import Padding, decoupled_fused_ssim
 
 
 def gaussian(window_size: int, sigma: float) -> torch.Tensor:
@@ -48,25 +48,98 @@ def decoupled_reference(
     return luminance.permute(0, 2, 3, 1), contrast_structure.permute(0, 2, 3, 1)
 
 
+@pytest.mark.parametrize("padding", ["same", "valid"])
+@pytest.mark.parametrize(
+    "gradient_mask",
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA extension test")
-def test_decoupled_fused_ssim_bhwc_matches_reference():
+def test_decoupled_fused_ssim_bhwc_matches_reference(
+    padding: Padding,
+    gradient_mask: tuple[bool, bool, bool],
+):
     torch.manual_seed(10)
-    img1 = torch.rand(2, 23, 19, 3, device="cuda", requires_grad=True)
-    img2 = torch.rand(2, 23, 19, 3, device="cuda", requires_grad=True)
-    img3 = torch.rand(2, 23, 19, 3, device="cuda", requires_grad=True)
+    img1, img2, img3 = (
+        torch.rand(2, 23, 19, 3, device="cuda", requires_grad=requires_grad)
+        for requires_grad in gradient_mask
+    )
 
-    reference_inputs = [image.detach().clone().requires_grad_(True) for image in (img1, img2, img3)]
+    reference_inputs = [
+        image.detach().clone().requires_grad_(requires_grad)
+        for image, requires_grad in zip((img1, img2, img3), gradient_mask, strict=True)
+    ]
     luminance_ref, contrast_structure_ref = decoupled_reference(*reference_inputs)
+    if padding == "valid":
+        luminance_ref = luminance_ref[:, 5:-5, 5:-5, :]
+        contrast_structure_ref = contrast_structure_ref[:, 5:-5, 5:-5, :]
     loss_ref = (
         0.2 * luminance_ref + 0.4 * contrast_structure_ref + 0.8 * luminance_ref * contrast_structure_ref
     ).mean()
-    grads_ref = torch.autograd.grad(loss_ref, reference_inputs)
+    reference_trainable = [image for image in reference_inputs if image.requires_grad]
+    grads_ref = torch.autograd.grad(loss_ref, reference_trainable)
 
-    luminance, contrast_structure = decoupled_fused_ssim(img1, img2, img3)
+    luminance, contrast_structure = decoupled_fused_ssim(img1, img2, img3, padding=padding)
     loss = (0.2 * luminance + 0.4 * contrast_structure + 0.8 * luminance * contrast_structure).mean()
-    grads = torch.autograd.grad(loss, (img1, img2, img3))
+    trainable = [image for image in (img1, img2, img3) if image.requires_grad]
+    grads = torch.autograd.grad(loss, trainable)
 
     torch.testing.assert_close(luminance, luminance_ref, rtol=1e-3, atol=1e-5)
     torch.testing.assert_close(contrast_structure, contrast_structure_ref, rtol=1e-3, atol=1e-5)
     for grad, grad_ref in zip(grads, grads_ref, strict=True):
         torch.testing.assert_close(grad, grad_ref, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("padding", ["same", "valid"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA extension test")
+def test_decoupled_fused_ssim_third_input_gradient(padding: Padding):
+    torch.manual_seed(11)
+    img1 = torch.rand(1, 23, 19, 3, device="cuda")
+    img2 = torch.rand(1, 23, 19, 3, device="cuda")
+    img3 = torch.rand(1, 23, 19, 3, device="cuda", requires_grad=True)
+
+    reference_img3 = img3.detach().clone().requires_grad_(True)
+    luminance_ref, contrast_structure_ref = decoupled_reference(img1, img2, reference_img3)
+    if padding == "valid":
+        luminance_ref = luminance_ref[:, 5:-5, 5:-5, :]
+        contrast_structure_ref = contrast_structure_ref[:, 5:-5, 5:-5, :]
+    gradient_ref = torch.autograd.grad((luminance_ref * contrast_structure_ref).mean(), reference_img3)[0]
+
+    saved_shapes: list[tuple[int, ...]] = []
+
+    def save_shape(tensor: torch.Tensor) -> torch.Tensor:
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(save_shape, lambda tensor: tensor):
+        luminance, contrast_structure = decoupled_fused_ssim(img1, img2, img3, padding=padding)
+    gradient = torch.autograd.grad((luminance * contrast_structure).mean(), img3)[0]
+
+    assert saved_shapes.count((1, 3, 23, 19)) == 1
+    torch.testing.assert_close(gradient, gradient_ref, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA extension test")
+def test_decoupled_forward_third_input_derivatives():
+    from fused_ssim_bhwc_cuda import decoupled_fusedssim
+
+    images = [torch.rand(1, 13, 12, 3, device="cuda") for _ in range(3)]
+    outputs = decoupled_fusedssim(0.01 ** 2, 0.03 ** 2, *images, False, False, True)
+    torch.cuda.synchronize()
+    derivative_maps = outputs[2:]
+
+    assert tuple(derivative.numel() > 0 for derivative in derivative_maps) == (
+        False,
+        True,
+        False,
+        False,
+        False,
+        False,
+    )

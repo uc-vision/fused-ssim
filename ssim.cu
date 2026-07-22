@@ -37,6 +37,19 @@ __device__ __forceinline__ float get_pix_bhwc(
     return img[b * H * W * CH + y * W * CH + x * CH + c];
 }
 
+// BHWC gradient fetch. Valid-mode gradients omit the five-pixel border.
+__device__ __forceinline__ float get_grad_bhwc(
+    const float* grad, int b, int c, int y, int x,
+    int CH, int H, int W, int padding
+) {
+    const int grad_y = y - padding;
+    const int grad_x = x - padding;
+    const int grad_h = H - 2 * padding;
+    const int grad_w = W - 2 * padding;
+    if (grad_x < 0 || grad_x >= grad_w || grad_y < 0 || grad_y >= grad_h) return 0.0f;
+    return grad[b * grad_h * grad_w * CH + grad_y * grad_w * CH + grad_x * CH + c];
+}
+
 // BCHW pixel fetch with zero padding (for internal derivative maps)
 __device__ __forceinline__ float get_pix_bchw(
     const float* img, int b, int c, int y, int x,
@@ -345,6 +358,7 @@ __global__ void fusedssim_backwardCUDA(
     }
 }
 
+template <bool need_img1, bool need_img2, bool need_img3>
 __global__ void decoupled_fusedssimCUDA(
     int H, int W, int CH,
     float C1, float C2,
@@ -526,14 +540,22 @@ __global__ void decoupled_fusedssimCUDA(
                 luminance_map[bhwc_idx] = C_ / A;
                 contrast_structure_map[bhwc_idx] = D_ / B;
 
-                if (dl_dmu1) {
+                if constexpr (need_img1 || need_img2 || need_img3) {
                     int bchw_idx = bIdx * CH * num_pix + c * num_pix + pix_id;
-                    dl_dmu1[bchw_idx]        = (2.f * mu3) / A - (2.f * mu1 * C_) / (A * A);
-                    dl_dmu3[bchw_idx]        = (2.f * mu1) / A - (2.f * mu3 * C_) / (A * A);
-                    dcs_dmu1[bchw_idx]       = (-2.f * mu2) / B + (2.f * mu1 * D_) / (B * B);
-                    dcs_dmu2[bchw_idx]       = (-2.f * mu1) / B + (2.f * mu2 * D_) / (B * B);
-                    dcs_dsigma1_sq[bchw_idx] = -D_ / (B * B);
-                    dcs_dsigma12[bchw_idx]   = 2.f / B;
+                    if constexpr (need_img1) {
+                        dl_dmu1[bchw_idx]  = (2.f * mu3) / A - (2.f * mu1 * C_) / (A * A);
+                        dcs_dmu1[bchw_idx] = (-2.f * mu2) / B + (2.f * mu1 * D_) / (B * B);
+                    }
+                    if constexpr (need_img2) {
+                        dcs_dmu2[bchw_idx] = (-2.f * mu1) / B + (2.f * mu2 * D_) / (B * B);
+                    }
+                    if constexpr (need_img3) {
+                        dl_dmu3[bchw_idx] = (2.f * mu1) / A - (2.f * mu3 * C_) / (A * A);
+                    }
+                    if constexpr (need_img1 || need_img2) {
+                        dcs_dsigma1_sq[bchw_idx] = -D_ / (B * B);
+                        dcs_dsigma12[bchw_idx]   = 2.f / B;
+                    }
                 }
             }
         }
@@ -541,8 +563,44 @@ __global__ void decoupled_fusedssimCUDA(
     }
 }
 
+struct DecoupledForwardArguments {
+    dim3 grid;
+    dim3 block;
+    cudaStream_t stream;
+    int H;
+    int W;
+    int CH;
+    float C1;
+    float C2;
+    const float* img1;
+    const float* img2;
+    const float* img3;
+    float* luminance_map;
+    float* contrast_structure_map;
+    float* dl_dmu1;
+    float* dl_dmu3;
+    float* dcs_dmu1;
+    float* dcs_dmu2;
+    float* dcs_dsigma1_sq;
+    float* dcs_dsigma12;
+};
+
+template <bool need_img1, bool need_img2, bool need_img3>
+void launch_decoupled_fusedssim(const DecoupledForwardArguments &arguments) {
+    decoupled_fusedssimCUDA<need_img1, need_img2, need_img3>
+        <<<arguments.grid, arguments.block, 0, arguments.stream>>>(
+        arguments.H, arguments.W, arguments.CH, arguments.C1, arguments.C2,
+        arguments.img1, arguments.img2, arguments.img3,
+        arguments.luminance_map, arguments.contrast_structure_map,
+        arguments.dl_dmu1, arguments.dl_dmu3,
+        arguments.dcs_dmu1, arguments.dcs_dmu2,
+        arguments.dcs_dsigma1_sq, arguments.dcs_dsigma12
+    );
+}
+
+template <bool use_luminance, bool use_contrast>
 __global__ void decoupled_fusedssim_backwardCUDA(
-    int H, int W, int CH,
+    int H, int W, int CH, int gradient_padding,
     const float* __restrict__ img1,
     const float* __restrict__ img2,
     const float* __restrict__ dL_dluminance_map,
@@ -560,14 +618,16 @@ __global__ void decoupled_fusedssim_backwardCUDA(
     const int num_pix = H * W;
     const int bIdx   = block.group_index().z;
 
-    __shared__ float sData[3][SHARED_Y][SHARED_X];
-    __shared__ float sScratch[CONV_Y][CONV_X][3];
+    __shared__ float sData[use_contrast ? 3 : 1][SHARED_Y][SHARED_X];
+    __shared__ float sScratch[CONV_Y][CONV_X][use_contrast ? 3 : 1];
 
     for (int c = 0; c < CH; ++c) {
         float p1 = 0.f, p2 = 0.f;
-        if (pix_x < W && pix_y < H) {
-            p1 = get_pix_bhwc(img1, bIdx, c, pix_y, pix_x, CH, H, W);
-            p2 = get_pix_bhwc(img2, bIdx, c, pix_y, pix_x, CH, H, W);
+        if constexpr (use_contrast) {
+            if (pix_x < W && pix_y < H) {
+                p1 = get_pix_bhwc(img1, bIdx, c, pix_y, pix_x, CH, H, W);
+                p2 = get_pix_bhwc(img2, bIdx, c, pix_y, pix_x, CH, H, W);
+            }
         }
 
         {
@@ -584,16 +644,26 @@ __global__ void decoupled_fusedssim_backwardCUDA(
                 for (int col = lane_id; col < SHARED_X; col += 32) {
                     int gx = startX + col - HALO;
 
-                    float chain_l = get_pix_bhwc(dL_dluminance_map, bIdx, c, gy, gx, CH, H, W);
-                    float chain_cs = get_pix_bhwc(dL_dcontrast_structure_map, bIdx, c, gy, gx, CH, H, W);
-                    float v_dl_mu1 = get_pix_bchw(dl_dmu1, bIdx, c, gy, gx, CH, H, W);
-                    float v_dcs_mu1 = get_pix_bchw(dcs_dmu1, bIdx, c, gy, gx, CH, H, W);
-                    float v_dcs_s1 = get_pix_bchw(dcs_dsigma1_sq, bIdx, c, gy, gx, CH, H, W);
-                    float v_dcs_s12 = get_pix_bchw(dcs_dsigma12, bIdx, c, gy, gx, CH, H, W);
-
-                    sData[0][row][col] = chain_l * v_dl_mu1 + chain_cs * v_dcs_mu1;
-                    sData[1][row][col] = chain_cs * v_dcs_s1;
-                    sData[2][row][col] = chain_cs * v_dcs_s12;
+                    float first_order = 0.f;
+                    if constexpr (use_luminance) {
+                        const float chain_l = get_grad_bhwc(
+                            dL_dluminance_map, bIdx, c, gy, gx, CH, H, W, gradient_padding
+                        );
+                        first_order = chain_l * get_pix_bchw(dl_dmu1, bIdx, c, gy, gx, CH, H, W);
+                    }
+                    if constexpr (use_contrast) {
+                        const float chain_cs = get_grad_bhwc(
+                            dL_dcontrast_structure_map, bIdx, c, gy, gx, CH, H, W, gradient_padding
+                        );
+                        first_order += chain_cs * get_pix_bchw(dcs_dmu1, bIdx, c, gy, gx, CH, H, W);
+                        sData[1][row][col] = chain_cs * get_pix_bchw(
+                            dcs_dsigma1_sq, bIdx, c, gy, gx, CH, H, W
+                        );
+                        sData[2][row][col] = chain_cs * get_pix_bchw(
+                            dcs_dsigma12, bIdx, c, gy, gx, CH, H, W
+                        );
+                    }
+                    sData[0][row][col] = first_order;
                 }
             }
         }
@@ -606,23 +676,31 @@ __global__ void decoupled_fusedssim_backwardCUDA(
             for (int pass = 0; pass < 2; ++pass) {
                 int yy = ly + pass * BLOCK_Y;
                 if (yy < CONV_Y) {
-                    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                    float a0 = 0.f;
+                    float a1 = 0.f;
+                    float a2 = 0.f;
 #pragma unroll
                     for (int d = 1; d <= HALO; ++d) {
                         float w = cGauss[HALO - d];
                         a0 += (sData[0][yy][lx - d] + sData[0][yy][lx + d]) * w;
-                        a1 += (sData[1][yy][lx - d] + sData[1][yy][lx + d]) * w;
-                        a2 += (sData[2][yy][lx - d] + sData[2][yy][lx + d]) * w;
+                        if constexpr (use_contrast) {
+                            a1 += (sData[1][yy][lx - d] + sData[1][yy][lx + d]) * w;
+                            a2 += (sData[2][yy][lx - d] + sData[2][yy][lx + d]) * w;
+                        }
                     }
                     {
                         float wc = cGauss[HALO];
                         a0 += sData[0][yy][lx] * wc;
-                        a1 += sData[1][yy][lx] * wc;
-                        a2 += sData[2][yy][lx] * wc;
+                        if constexpr (use_contrast) {
+                            a1 += sData[1][yy][lx] * wc;
+                            a2 += sData[2][yy][lx] * wc;
+                        }
                     }
                     sScratch[yy][threadIdx.x][0] = a0;
-                    sScratch[yy][threadIdx.x][1] = a1;
-                    sScratch[yy][threadIdx.x][2] = a2;
+                    if constexpr (use_contrast) {
+                        sScratch[yy][threadIdx.x][1] = a1;
+                        sScratch[yy][threadIdx.x][2] = a2;
+                    }
                 }
             }
         }
@@ -632,23 +710,33 @@ __global__ void decoupled_fusedssim_backwardCUDA(
             int ly = threadIdx.y + HALO;
             int lx = threadIdx.x;
 
-            float s0 = 0.f, s1 = 0.f, s2 = 0.f;
+            float s0 = 0.f;
+            float s1 = 0.f;
+            float s2 = 0.f;
 #pragma unroll
             for (int d = 1; d <= HALO; ++d) {
                 float w = cGauss[HALO - d];
                 s0 += (sScratch[ly - d][lx][0] + sScratch[ly + d][lx][0]) * w;
-                s1 += (sScratch[ly - d][lx][1] + sScratch[ly + d][lx][1]) * w;
-                s2 += (sScratch[ly - d][lx][2] + sScratch[ly + d][lx][2]) * w;
+                if constexpr (use_contrast) {
+                    s1 += (sScratch[ly - d][lx][1] + sScratch[ly + d][lx][1]) * w;
+                    s2 += (sScratch[ly - d][lx][2] + sScratch[ly + d][lx][2]) * w;
+                }
             }
             {
                 float wc = cGauss[HALO];
                 s0 += sScratch[ly][lx][0] * wc;
-                s1 += sScratch[ly][lx][1] * wc;
-                s2 += sScratch[ly][lx][2] * wc;
+                if constexpr (use_contrast) {
+                    s1 += sScratch[ly][lx][1] * wc;
+                    s2 += sScratch[ly][lx][2] * wc;
+                }
             }
 
             int bhwc_idx = bIdx * num_pix * CH + pix_id * CH + c;
-            dL_dimg1[bhwc_idx] = s0 + (2.f * p1) * s1 + p2 * s2;
+            float gradient = s0;
+            if constexpr (use_contrast) {
+                gradient += (2.f * p1) * s1 + p2 * s2;
+            }
+            dL_dimg1[bhwc_idx] = gradient;
         }
         block.sync();
     }
@@ -732,7 +820,7 @@ std::tuple<
 decoupled_fusedssim(
     float C1, float C2,
     torch::Tensor &img1, torch::Tensor &img2, torch::Tensor &img3,
-    bool train
+    bool need_img1, bool need_img2, bool need_img3
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -749,27 +837,66 @@ decoupled_fusedssim(
     auto contrast_structure_map = torch::empty_like(img1);
 
     auto derivative_shape = std::vector<int64_t>{B, CH, H, W};
-    auto dl_dmu1        = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
-    auto dl_dmu3        = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
-    auto dcs_dmu1       = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
-    auto dcs_dmu2       = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
-    auto dcs_dsigma1_sq = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
-    auto dcs_dsigma12   = train ? torch::empty(derivative_shape, img1.options()) : torch::empty({0}, img1.options());
+    auto empty            = torch::empty({0}, img1.options());
+    const bool need_contrast = need_img1 || need_img2;
+    auto dl_dmu1          = need_img1 ? torch::empty(derivative_shape, img1.options()) : empty;
+    auto dl_dmu3          = need_img3 ? torch::empty(derivative_shape, img1.options()) : empty;
+    auto dcs_dmu1         = need_img1 ? torch::empty(derivative_shape, img1.options()) : empty;
+    auto dcs_dmu2         = need_img2 ? torch::empty(derivative_shape, img1.options()) : empty;
+    auto dcs_dsigma1_sq   = need_contrast ? torch::empty(derivative_shape, img1.options()) : empty;
+    auto dcs_dsigma12     = need_contrast ? torch::empty(derivative_shape, img1.options()) : empty;
 
-    decoupled_fusedssimCUDA<<<grid, block, 0, stream>>>(
-        H, W, CH, C1, C2,
+    const int derivative_mask =
+        (need_img1 ? 1 : 0) |
+        (need_img2 ? 2 : 0) |
+        (need_img3 ? 4 : 0);
+    const DecoupledForwardArguments arguments{
+        grid,
+        block,
+        stream,
+        H,
+        W,
+        CH,
+        C1,
+        C2,
         img1.data_ptr<float>(),
         img2.data_ptr<float>(),
         img3.data_ptr<float>(),
         luminance_map.data_ptr<float>(),
         contrast_structure_map.data_ptr<float>(),
-        train ? dl_dmu1.data_ptr<float>()        : nullptr,
-        train ? dl_dmu3.data_ptr<float>()        : nullptr,
-        train ? dcs_dmu1.data_ptr<float>()       : nullptr,
-        train ? dcs_dmu2.data_ptr<float>()       : nullptr,
-        train ? dcs_dsigma1_sq.data_ptr<float>() : nullptr,
-        train ? dcs_dsigma12.data_ptr<float>()   : nullptr
-    );
+        need_img1 ? dl_dmu1.data_ptr<float>() : nullptr,
+        need_img3 ? dl_dmu3.data_ptr<float>() : nullptr,
+        need_img1 ? dcs_dmu1.data_ptr<float>() : nullptr,
+        need_img2 ? dcs_dmu2.data_ptr<float>() : nullptr,
+        need_contrast ? dcs_dsigma1_sq.data_ptr<float>() : nullptr,
+        need_contrast ? dcs_dsigma12.data_ptr<float>() : nullptr,
+    };
+    switch (derivative_mask) {
+        case 0:
+            launch_decoupled_fusedssim<false, false, false>(arguments);
+            break;
+        case 1:
+            launch_decoupled_fusedssim<true, false, false>(arguments);
+            break;
+        case 2:
+            launch_decoupled_fusedssim<false, true, false>(arguments);
+            break;
+        case 3:
+            launch_decoupled_fusedssim<true, true, false>(arguments);
+            break;
+        case 4:
+            launch_decoupled_fusedssim<false, false, true>(arguments);
+            break;
+        case 5:
+            launch_decoupled_fusedssim<true, false, true>(arguments);
+            break;
+        case 6:
+            launch_decoupled_fusedssim<false, true, true>(arguments);
+            break;
+        case 7:
+            launch_decoupled_fusedssim<true, true, true>(arguments);
+            break;
+    }
 
     return std::make_tuple(
         luminance_map,
@@ -797,7 +924,8 @@ decoupled_fusedssim_backward(
     torch::Tensor &dcs_dmu1,
     torch::Tensor &dcs_dmu2,
     torch::Tensor &dcs_dsigma1_sq,
-    torch::Tensor &dcs_dsigma12
+    torch::Tensor &dcs_dsigma12,
+    int gradient_padding
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -813,60 +941,53 @@ decoupled_fusedssim_backward(
     auto dL_dimg1 = need_img1 ? torch::empty_like(img1) : torch::empty({0}, img1.options());
     auto dL_dimg2 = need_img2 ? torch::empty_like(img2) : torch::empty({0}, img2.options());
     auto dL_dimg3 = need_img3 ? torch::empty_like(img3) : torch::empty({0}, img3.options());
-    auto zeros_bhwc = torch::zeros_like(img1);
-    auto zeros_bchw = torch::zeros({B, CH, H, W}, img1.options());
-
-    auto dl_dmu1_arg = dl_dmu1.numel() == 0 ? zeros_bchw : dl_dmu1;
-    auto dl_dmu3_arg = dl_dmu3.numel() == 0 ? zeros_bchw : dl_dmu3;
-    auto dcs_dmu1_arg = dcs_dmu1.numel() == 0 ? zeros_bchw : dcs_dmu1;
-    auto dcs_dmu2_arg = dcs_dmu2.numel() == 0 ? zeros_bchw : dcs_dmu2;
 
     dim3 grid((W + BLOCK_X - 1) / BLOCK_X,
               (H + BLOCK_Y - 1) / BLOCK_Y, B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
     if (need_img1) {
-        decoupled_fusedssim_backwardCUDA<<<grid, block, 0, stream>>>(
-            H, W, CH,
+        decoupled_fusedssim_backwardCUDA<true, true><<<grid, block, 0, stream>>>(
+            H, W, CH, gradient_padding,
             img1.contiguous().data_ptr<float>(),
             img2.contiguous().data_ptr<float>(),
             dL_dluminance_map.contiguous().data_ptr<float>(),
             dL_dcontrast_structure_map.contiguous().data_ptr<float>(),
             dL_dimg1.data_ptr<float>(),
-            dl_dmu1_arg.contiguous().data_ptr<float>(),
-            dcs_dmu1_arg.contiguous().data_ptr<float>(),
+            dl_dmu1.contiguous().data_ptr<float>(),
+            dcs_dmu1.contiguous().data_ptr<float>(),
             dcs_dsigma1_sq.contiguous().data_ptr<float>(),
             dcs_dsigma12.contiguous().data_ptr<float>()
         );
     }
 
     if (need_img2) {
-        decoupled_fusedssim_backwardCUDA<<<grid, block, 0, stream>>>(
-            H, W, CH,
+        decoupled_fusedssim_backwardCUDA<false, true><<<grid, block, 0, stream>>>(
+            H, W, CH, gradient_padding,
             img2.contiguous().data_ptr<float>(),
             img1.contiguous().data_ptr<float>(),
-            zeros_bhwc.data_ptr<float>(),
+            nullptr,
             dL_dcontrast_structure_map.contiguous().data_ptr<float>(),
             dL_dimg2.data_ptr<float>(),
-            zeros_bchw.data_ptr<float>(),
-            dcs_dmu2_arg.contiguous().data_ptr<float>(),
+            nullptr,
+            dcs_dmu2.contiguous().data_ptr<float>(),
             dcs_dsigma1_sq.contiguous().data_ptr<float>(),
             dcs_dsigma12.contiguous().data_ptr<float>()
         );
     }
 
     if (need_img3) {
-        decoupled_fusedssim_backwardCUDA<<<grid, block, 0, stream>>>(
-            H, W, CH,
+        decoupled_fusedssim_backwardCUDA<true, false><<<grid, block, 0, stream>>>(
+            H, W, CH, gradient_padding,
             img3.contiguous().data_ptr<float>(),
-            img2.contiguous().data_ptr<float>(),
+            nullptr,
             dL_dluminance_map.contiguous().data_ptr<float>(),
-            zeros_bhwc.data_ptr<float>(),
+            nullptr,
             dL_dimg3.data_ptr<float>(),
-            dl_dmu3_arg.contiguous().data_ptr<float>(),
-            zeros_bchw.data_ptr<float>(),
-            zeros_bchw.data_ptr<float>(),
-            zeros_bchw.data_ptr<float>()
+            dl_dmu3.contiguous().data_ptr<float>(),
+            nullptr,
+            nullptr,
+            nullptr
         );
     }
 
