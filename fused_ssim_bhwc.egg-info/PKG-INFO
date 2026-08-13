@@ -1,6 +1,6 @@
-Metadata-Version: 2.2
+Metadata-Version: 2.4
 Name: fused-ssim-bhwc
-Version: 1.0.11
+Version: 1.0.12
 Summary: Efficient fully-fused differentiable SSIM implementation
 Author: Rahul Goel
 Project-URL: Homepage, https://github.com/rahul-goel/fused-ssim
@@ -9,6 +9,7 @@ Requires-Python: >=3.8
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: torch>=2.0.0
+Dynamic: license-file
 
 # Fully Fused Differentiable SSIM
 
